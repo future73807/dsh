@@ -1,0 +1,5 @@
+# ZCode session metadata
+.zcode/
+
+# Local credentials and environment overrides
+.env
