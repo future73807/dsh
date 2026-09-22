@@ -3,3 +3,8 @@
 
 # Local credentials and environment overrides
 .env
+
+# Chromium/Electron 调试日志
+# VS Code 的语言服务器以 Electron 的 Node 模式启动，工作目录即工作区根目录，
+# 因此会把 crashpad 注册失败的噪音日志写到这里。
+*.log

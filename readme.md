@@ -363,6 +363,26 @@ start-opencode-go-proxy.cmd
 
 代理默认监听 `127.0.0.1:8788`，并把请求转发到 `https://opencode.ai/zen/go`。启动窗口保持运行即可；停止时在窗口中按 `Ctrl+C`。
 
+启动时可以用参数指定思考强度，也可以不带参数让代理弹出菜单询问：
+
+```powershell
+& .\start-opencode-go-proxy.cmd high     # 直接指定
+& .\start-opencode-go-proxy.cmd          # 弹菜单：1 不思考 / 2 低 / 3 标准 / 4 最大
+```
+
+| 参数 | 含义 | 注入的请求体字段 |
+| --- | --- | --- |
+| `none` | 不思考（最快、最省 token） | 清除 `reasoning_effort` / `thinking` |
+| `low` | 轻度思考 | `"reasoning_effort": "low"` |
+| `high` | 标准思考（**默认**，不带参数时回车即此档） | `"reasoning_effort": "high"` |
+| `max` | 最大思考（最慢、最费 token） | `"reasoning_effort": "max"` |
+| `off` | 代理完全不注入，请求体原样转发 | 不改请求体 |
+
+兼容别名：`medium`/`xhigh`/`mid` → `high`，`minimal` → `low`，`no`/`false` → `off`。
+
+> 档位取值沿用 DeepSeek 官方 `chat/completions` 的 `reasoning_effort` 定义（`none` / `low` / `high` / `max`）。
+> 代理只改写 `/chat/completions` 请求，`GET`/`HEAD` 以及其它路径原样转发；改写时会同步修正 `Content-Length`。
+
 ### 客户端配置
 
 在 Cherry Studio 或其它客户端中只需要把 **Base URL** 改为：
@@ -379,7 +399,37 @@ http://127.0.0.1:8788/v1
 
 **不要继续使用** `https://opencode.ai/zen/go/v1` 作为客户端 Base URL，否则请求会绕过代理，仍然会收到 `Request is missing x-opencode-session`。
 
-代理会在每个进程启动时生成一个稳定的 session ID，并在进程存活期间复用；同时覆盖请求中的 `User-Agent` 为编码客户端标识。请求体、查询参数、业务响应和流式响应会直接转发，不修改 IDE 配置，也不需要额外的 npm 依赖。
+代理会在每个进程启动时生成一个稳定的 session ID，并在进程存活期间复用；同时覆盖请求中的 `User-Agent` 为编码客户端标识。查询参数、业务响应和流式响应会直接转发，不修改 IDE 配置，也不需要额外的 npm 依赖。请求体仅在注入思考强度时改写，`off` 档完全不动。
+
+### 与 VS Code Copilot 配合（重要）
+
+思考强度由代理注入，因此 VS Code 侧**不要**再配 `supportsReasoningEffort` / `reasoningEffortFormat`（会和代理注入打架，模型选择器里还会多出一个无效的 Thinking Effort 菜单）。
+
+但 VS Code 侧**必须**保留 `"thinking": true`：
+
+```jsonc
+{
+  "id": "deepseek-v4.1-flash",
+  "url": "http://127.0.0.1:8788",
+  "thinking": true,        // 必留！否则会 400
+  "toolCalling": true,
+  "vision": true,
+  "maxInputTokens": 1000000,
+  "maxOutputTokens": 384000
+}
+```
+
+原因：DeepSeek 思考模式要求把上一轮 assistant 工具调用消息的 `reasoning_content` 原样回传，否则上游返回
+`The reasoning_content in the thinking mode must be passed back to the API.`。
+Copilot 扩展里这段逻辑被 `capabilities.supports.thinking` 门控（默认 `false`），只有 `"thinking": true` 才会回传。
+**代理无法补这个字段**（它出现在响应的 SSE 增量里，代理不解析响应体），所以这一项只能靠 VS Code 配置。
+
+配合关系：
+
+```
+思考强度      代理启动时注入        改请求体
+reasoning_content 回传   VS Code 的 thinking:true   改请求体
+```
 
 ### 连接验证
 

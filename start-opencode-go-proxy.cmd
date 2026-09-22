@@ -12,7 +12,10 @@ if errorlevel 1 (
 )
 
 node --version
-node "%~dp0opencode-go-proxy.mjs"
+
+rem 可选参数：思考强度 none / low / high / max / off
+rem 不带参数时由代理弹出菜单询问。
+node "%~dp0opencode-go-proxy.mjs" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
