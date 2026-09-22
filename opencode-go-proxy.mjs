@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import readline from 'node:readline';
+import zlib from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -43,6 +44,13 @@ const THINK_EFFORT_ALIASES = new Map([
   ['maximum', 'max'],
 ]);
 const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+
+// 上游错误响应：代理把 4xx/5xx 的原因解析出来打印到控制台，
+// 并在上游没给可用信息时（空响应体、或 JSON 里没有 message）补上具体原因，
+// 避免客户端只看到一个光秃秃的状态码。
+const MAX_ERROR_BODY_BYTES = 128 * 1024;
+const MAX_ERROR_REASON_CHARS = 1500;
+const ERROR_MESSAGE_KEYS = ['message', 'msg', 'detail', 'reason', 'error_description'];
 
 // 上游（DeepSeek 思考模式）要求：历史里带 tool_calls 的 assistant 消息必须回传 reasoning_content，
 // 否则整轮请求 400：The reasoning_content in the thinking mode must be passed back to the API.
@@ -313,7 +321,7 @@ function applyThinkEffort(body) {
   return body;
 }
 
-function injectThinkEffort(rawBody, pathname) {
+function injectThinkEffort(rawBody, pathname, meta) {
   if (!rawBody.length || thinkEffort === 'off') {
     return rawBody;
   }
@@ -340,6 +348,12 @@ function injectThinkEffort(rawBody, pathname) {
   if (fixed.restored) notes.push(`回填思考 ${fixed.restored} 条`);
   if (fixed.placeholder) notes.push(`占位思考 ${fixed.placeholder} 条`);
   console.log(`[proxy] 注入 ${notes.join('，')}`);
+
+  if (meta) {
+    meta.model = typeof parsed?.model === 'string' ? parsed.model : undefined;
+    meta.messageCount = Array.isArray(parsed?.messages) ? parsed.messages.length : undefined;
+    meta.note = notes.join('，');
+  }
 
   const serialized = Buffer.from(JSON.stringify(parsed), 'utf8');
   return serialized;
@@ -428,6 +442,209 @@ function logRequest(method, path, statusCode) {
   console.log(`[proxy] ${method} ${path} -> ${statusCode} (session ${SESSION_ID})`);
 }
 
+function truncateText(text, max) {
+  if (typeof text !== 'string') return '';
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max)}…` : collapsed;
+}
+
+// 上游错误体可能是压缩过的，解压一份副本用于阅读（转发时仍用原始字节）。
+function decodePossiblyCompressed(buffer, headers) {
+  const encoding = String(headers['content-encoding'] ?? '').toLowerCase();
+
+  try {
+    if (encoding.includes('gzip')) return zlib.gunzipSync(buffer).toString('utf8');
+    if (encoding.includes('br')) return zlib.brotliDecompressSync(buffer).toString('utf8');
+    if (encoding.includes('deflate')) return zlib.inflateSync(buffer).toString('utf8');
+    if (encoding.includes('zstd') && typeof zlib.zstdDecompressSync === 'function') {
+      return zlib.zstdDecompressSync(buffer).toString('utf8');
+    }
+  } catch {
+    // 解压失败就退回原始字节
+  }
+
+  return buffer.toString('utf8');
+}
+
+// 从错误响应体里挖出人话。兼容 {error:{message}}、{error:"..."}、{message} 等常见网关形状。
+function extractErrorReason(text) {
+  const trimmed = (text ?? '').trim();
+  if (!trimmed) return '';
+
+  let json;
+  try {
+    json = JSON.parse(trimmed);
+  } catch {
+    return truncateText(trimmed, MAX_ERROR_REASON_CHARS);
+  }
+
+  const visited = new Set();
+  const queue = [json];
+
+  while (queue.length) {
+    const node = queue.shift();
+    if (!node || typeof node !== 'object' || visited.has(node)) continue;
+    visited.add(node);
+
+    for (const key of ERROR_MESSAGE_KEYS) {
+      const value = node[key];
+      if (typeof value === 'string' && value.trim()) {
+        return truncateText(value, MAX_ERROR_REASON_CHARS);
+      }
+    }
+
+    if (typeof node.error === 'string' && node.error.trim()) {
+      return truncateText(node.error, MAX_ERROR_REASON_CHARS);
+    }
+
+    for (const key of ['error', 'errors', 'details']) {
+      const value = node[key];
+      if (Array.isArray(value)) queue.push(...value);
+      else if (value && typeof value === 'object') queue.push(value);
+    }
+  }
+
+  return truncateText(trimmed, MAX_ERROR_REASON_CHARS);
+}
+
+// 错误体是 JSON 但里面没有可读 message 时，补一条，否则客户端拿不到任何原因。
+function ensureErrorMessage(text, statusCode) {
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return { text, changed: false };
+  }
+
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    return { text, changed: false };
+  }
+
+  const errorObject = json.error && typeof json.error === 'object' && !Array.isArray(json.error)
+    ? json.error
+    : json;
+
+  const alreadyReadable = ERROR_MESSAGE_KEYS.some(
+    (key) => typeof errorObject[key] === 'string' && errorObject[key].trim(),
+  ) || (typeof json.error === 'string' && json.error.trim());
+
+  if (alreadyReadable) {
+    return { text, changed: false };
+  }
+
+  const statusText = http.STATUS_CODES[statusCode] ?? '';
+  errorObject.message = `Upstream returned ${statusCode}${statusText ? ` ${statusText}` : ''} without a message field.`;
+
+  return { text: JSON.stringify(json), changed: true };
+}
+
+function relayErrorResponse({ statusCode, responseHeaders, upstreamResponse, response, method, url, requestMeta }) {
+  const chunks = [];
+  let total = 0;
+  let settled = false;
+
+  const statusText = http.STATUS_CODES[statusCode] ?? '';
+
+  const describeRequest = () => {
+    if (!requestMeta) return '';
+    const bits = [];
+    if (requestMeta.model) bits.push(`模型 ${requestMeta.model}`);
+    if (requestMeta.messageCount !== undefined) bits.push(`消息 ${requestMeta.messageCount} 条`);
+    if (requestMeta.note) bits.push(requestMeta.note);
+    return bits.length ? `（${bits.join('，')}）` : '';
+  };
+
+  const onOverflow = () => {
+    if (settled) return;
+    settled = true;
+
+    console.error(
+      `[proxy] 上游错误 ${statusCode} ${statusText} ${method} ${url}：响应体超过 ${MAX_ERROR_BODY_BYTES} 字节，原样透传，未解析原因${describeRequest()}`,
+    );
+
+    if (response.destroyed) {
+      upstreamResponse.resume();
+      return;
+    }
+
+    // 长度已不可知，去掉 content-length 让 Node 走 chunked。
+    const headers = { ...responseHeaders };
+    delete headers['content-length'];
+    response.writeHead(statusCode, headers);
+    for (const chunk of chunks) response.write(chunk);
+    upstreamResponse.pipe(response);
+    upstreamResponse.resume();
+  };
+
+  upstreamResponse.on('data', (chunk) => {
+    if (settled) return;
+    total += chunk.length;
+    if (total > MAX_ERROR_BODY_BYTES) {
+      onOverflow();
+      return;
+    }
+    chunks.push(chunk);
+  });
+
+  upstreamResponse.on('end', () => {
+    if (settled) return;
+    settled = true;
+
+    const raw = Buffer.concat(chunks);
+    const decoded = raw.length ? decodePossiblyCompressed(raw, responseHeaders) : '';
+    const reason = extractErrorReason(decoded);
+
+    console.error(
+      `[proxy] 上游错误 ${statusCode} ${statusText} ${method} ${url}：${reason || '上游返回空响应体，无具体原因'}${describeRequest()}`,
+    );
+
+    if (response.destroyed || response.writableEnded) return;
+
+    if (raw.length) {
+      const headers = { ...responseHeaders, 'content-length': raw.length };
+      let body = raw;
+
+      const ensured = ensureErrorMessage(decoded, statusCode);
+      if (ensured.changed) {
+        body = Buffer.from(ensured.text, 'utf8');
+        headers['content-length'] = body.length;
+        // 重新序列化成明文，原来的压缩标记必须去掉。
+        delete headers['content-encoding'];
+        console.log('[proxy] 上游错误体缺少 message 字段，已补上状态说明');
+      }
+
+      response.writeHead(statusCode, headers);
+      response.end(body);
+      return;
+    }
+
+    // 上游什么都没给：补一个带原因的 JSON 错误体。
+    const body = JSON.stringify({
+      error: {
+        message: `Upstream returned ${statusCode}${statusText ? ` ${statusText}` : ''} with an empty response body.`,
+        type: 'proxy_upstream_error',
+        code: 'upstream_error',
+        proxy_upstream_status: statusCode,
+      },
+    });
+
+    response.writeHead(statusCode, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(body),
+      'cache-control': 'no-store',
+    });
+    response.end(body);
+  });
+
+  upstreamResponse.on('error', (error) => {
+    if (settled) return;
+    settled = true;
+    chunks.length = 0;
+    console.error(`[proxy] 上游错误 ${statusCode} ${statusText} ${method} ${url}：响应中断 ${error.message}${describeRequest()}`);
+    writeProxyError(response, 502, `Upstream connection failed while returning ${statusCode}: ${error.message}`);
+  });
+}
+
 // 旁路监听响应数据流：不影响原有转发，只在流结束后分析出思考内容与 tool_call id。
 function sniffReasoningFromUpstream(upstreamResponse) {
   const chunks = [];
@@ -472,6 +689,9 @@ function handleRequest(request, response) {
   headers['user-agent'] = USER_AGENT;
   headers['x-opencode-session'] = SESSION_ID;
 
+  // 供错误日志标注"是哪一个请求失败了"，不记录任何消息内容。
+  const requestMeta = {};
+
   const upstreamRequest = https.request(
     {
       protocol: target.protocol,
@@ -484,6 +704,22 @@ function handleRequest(request, response) {
     (upstreamResponse) => {
       const responseHeaders = copyEndToEndHeaders(upstreamResponse.headers);
       const statusCode = upstreamResponse.statusCode ?? 502;
+      const methodName = request.method ?? 'UNKNOWN';
+      const requestUrl = request.url ?? '/';
+
+      // 4xx/5xx：解析出具体原因，必要时补上说明。
+      if (statusCode >= 400) {
+        relayErrorResponse({
+          statusCode,
+          responseHeaders,
+          upstreamResponse,
+          response,
+          method: methodName,
+          url: requestUrl,
+          requestMeta,
+        });
+        return;
+      }
 
       // 只嗅探成功的 chat/completions 响应，其余原样透传。
       if (statusCode === 200 && isChatCompletionsPath(target.pathname)) {
@@ -492,7 +728,7 @@ function handleRequest(request, response) {
 
       if (!response.destroyed) {
         response.writeHead(statusCode, responseHeaders);
-        logRequest(request.method ?? 'UNKNOWN', request.url ?? '/', statusCode);
+        logRequest(methodName, requestUrl, statusCode);
         upstreamResponse.pipe(response);
       } else {
         upstreamResponse.resume();
@@ -539,7 +775,7 @@ function handleRequest(request, response) {
 
       let payload = rawBody;
       try {
-        payload = injectThinkEffort(rawBody, new URL(request.url || '/', 'http://127.0.0.1').pathname);
+        payload = injectThinkEffort(rawBody, new URL(request.url || '/', 'http://127.0.0.1').pathname, requestMeta);
       } catch (error) {
         console.error(`[proxy] 注入思考强度失败，按原样转发: ${error.message}`);
         payload = rawBody;

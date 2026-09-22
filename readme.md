@@ -443,6 +443,31 @@ VS Code 侧配置建议：
 不要配 `supportsReasoningEffort` / `reasoningEffortFormat` —— 思考强度由代理注入，配了只会让模型选择器
 多出一个不起作用的 Thinking Effort 菜单。
 
+### 错误原因上报（非 200）
+
+上游返回 4xx/5xx 时，代理会把**具体原因**解析出来：
+
+**控制台**（一眼看到到底为什么失败）：
+
+```text
+[proxy] 上游错误 400 Bad Request POST /v1/chat/completions：The reasoning_content in the thinking mode must be passed back to the API.（模型 deepseek-v4.1-flash，消息 12 条，reasoning_effort=high，回填思考 3 条）
+```
+
+括号里是代理标注的请求摘要，**不含任何消息内容**，只用于判断是哪个请求、参数如何。
+
+**响应体**（保证客户端一定能拿到原因）：
+
+| 上游返回 | 代理行为 |
+| --- | --- |
+| JSON 且含 `error.message` | 原样透传 |
+| JSON 但缺 `message` | 补一条 `message`（状态说明），原有字段不动 |
+| 空响应体 | 合成 JSON 错误体，含状态码与 `proxy_upstream_status` |
+| 纯文本 / HTML | 原样透传，控制台打印片段 |
+| 压缩（gzip/br/deflate/zstd） | 原样透传**压缩字节**，控制台打印解压后的原因 |
+| 响应体 > 128 KB | 原样流式透传，不解析（避免占用内存） |
+
+状态码与响应头始终保持上游原值，不改写语义。
+
 ### 连接验证
 
 代理启动后，可用下面的命令验证本地转发是否工作（将 `<你的Key>` 替换为真实 Key；不要把 Key 写进脚本或提交到仓库）：
