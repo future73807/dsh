@@ -8,3 +8,6 @@
 # VS Code 的语言服务器以 Electron 的 Node 模式启动，工作目录即工作区根目录，
 # 因此会把 crashpad 注册失败的噪音日志写到这里。
 *.log
+
+# 代理运行时缓存（思考内容，用于回填 reasoning_content）
+proxy-reasoning-cache.json

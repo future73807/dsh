@@ -401,17 +401,38 @@ http://127.0.0.1:8788/v1
 
 代理会在每个进程启动时生成一个稳定的 session ID，并在进程存活期间复用；同时覆盖请求中的 `User-Agent` 为编码客户端标识。查询参数、业务响应和流式响应会直接转发，不修改 IDE 配置，也不需要额外的 npm 依赖。请求体仅在注入思考强度时改写，`off` 档完全不动。
 
-### 与 VS Code Copilot 配合（重要）
+### 思考内容回传（代理自动处理）
 
-思考强度由代理注入，因此 VS Code 侧**不要**再配 `supportsReasoningEffort` / `reasoningEffortFormat`（会和代理注入打架，模型选择器里还会多出一个无效的 Thinking Effort 菜单）。
+DeepSeek 思考模式有一条硬性校验：历史里带 `tool_calls` 的 assistant 消息必须回传 `reasoning_content`，
+否则整轮请求 400：
 
-但 VS Code 侧**必须**保留 `"thinking": true`：
+```text
+The reasoning_content in the thinking mode must be passed back to the API.
+```
+
+这也解释了该报错的"时好时坏"现象：模型直接回答没问题，一旦调用工具，**下一轮就必然失败**。
+
+**为什么客户端补不上**：VS Code Copilot 的回传逻辑被 `if (thinking.id)` 门控 —— 只有上游提供
+`cot_id` / `reasoning_opaque` / `signature` 时才会带上 `reasoning_content`。DeepSeek 的流式响应只给
+`reasoning_content`、不给 id，所以永远不回传。配置里的 `"thinking": true` 只满足外层开关，过不了
+`thinking.id` 这道门。
+
+**代理的做法**：
+
+1. 旁路读取 `/chat/completions` 的响应流（**只读不改**，不影响转发），提取思考文本，按 `tool_call id` 缓存；
+2. 后续请求中，凡带 `tool_calls` 但缺 `reasoning_content` 的 assistant 消息，用缓存的**真实内容**补回；
+3. 缓存未命中时补一个非空占位串，保证不被上游挡下；
+4. 缓存落盘到 `proxy-reasoning-cache.json`，使代理重启后旧会话仍能命中真实内容（500 条 LRU）。
+
+客户端已自带 `reasoning_content` 时不会被覆盖；`none` 档不做回填（上游在该模式下不校验）。
+
+VS Code 侧配置建议：
 
 ```jsonc
 {
   "id": "deepseek-v4.1-flash",
   "url": "http://127.0.0.1:8788",
-  "thinking": true,        // 必留！否则会 400
+  "thinking": true,          // 保留：便于 VS Code 显示思考过程
   "toolCalling": true,
   "vision": true,
   "maxInputTokens": 1000000,
@@ -419,17 +440,8 @@ http://127.0.0.1:8788/v1
 }
 ```
 
-原因：DeepSeek 思考模式要求把上一轮 assistant 工具调用消息的 `reasoning_content` 原样回传，否则上游返回
-`The reasoning_content in the thinking mode must be passed back to the API.`。
-Copilot 扩展里这段逻辑被 `capabilities.supports.thinking` 门控（默认 `false`），只有 `"thinking": true` 才会回传。
-**代理无法补这个字段**（它出现在响应的 SSE 增量里，代理不解析响应体），所以这一项只能靠 VS Code 配置。
-
-配合关系：
-
-```
-思考强度      代理启动时注入        改请求体
-reasoning_content 回传   VS Code 的 thinking:true   改请求体
-```
+不要配 `supportsReasoningEffort` / `reasoningEffortFormat` —— 思考强度由代理注入，配了只会让模型选择器
+多出一个不起作用的 Thinking Effort 菜单。
 
 ### 连接验证
 

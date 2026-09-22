@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import readline from 'node:readline';
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const LISTEN_HOST = '127.0.0.1';
@@ -41,6 +43,24 @@ const THINK_EFFORT_ALIASES = new Map([
   ['maximum', 'max'],
 ]);
 const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+
+// 上游（DeepSeek 思考模式）要求：历史里带 tool_calls 的 assistant 消息必须回传 reasoning_content，
+// 否则整轮请求 400：The reasoning_content in the thinking mode must be passed back to the API.
+//
+// 但 VS Code Copilot 只在响应提供 cot_id / reasoning_opaque / signature 时才回传该字段
+// （内部 getCompletionsCallback 被 `if (thinking.id)` 门控），
+// 而 DeepSeek 流式响应只给 reasoning_content、不给 id，于是永远不回传。
+// 代理是唯一能同时看到两个方向的地方：旁路读取响应流缓存真实思考内容，在后续请求里补回去。
+const REASONING_CACHE_LIMIT = 500;
+const MAX_RESPONSE_SNIFF_BYTES = 16 * 1024 * 1024;
+// 单条思考内容上限，防止个别超长响应把缓存文件撑爆。
+const MAX_REASONING_ENTRY_CHARS = 200_000;
+// 缓存落盘，使代理重启后旧会话仍能命中真实思考内容（否则只能走占位兜底）。
+const REASONING_CACHE_FILE = path.join(import.meta.dirname, 'proxy-reasoning-cache.json');
+// 缓存未命中时的兜底值：上游只校验该字段是否存在，非空占位即可通过。
+const REASONING_PLACEHOLDER = '(thinking content was not returned by the client)';
+
+const reasoningCache = new Map();
 
 let thinkEffort = DEFAULT_THINK_EFFORT;
 
@@ -115,6 +135,157 @@ function readRequestBody(request) {
   });
 }
 
+function loadReasoningCache() {
+  let raw;
+  try {
+    raw = fs.readFileSync(REASONING_CACHE_FILE, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error(`[proxy] 读取思考缓存失败（忽略）: ${error.message}`);
+    }
+    return;
+  }
+
+  try {
+    const entries = JSON.parse(raw);
+    if (Array.isArray(entries)) {
+      for (const entry of entries) {
+        if (!Array.isArray(entry) || entry.length !== 2) continue;
+        const [key, value] = entry;
+        if (typeof key === 'string' && typeof value === 'string') reasoningCache.set(key, value);
+      }
+    }
+    if (reasoningCache.size) {
+      console.log(`[proxy] 已从磁盘恢复 ${reasoningCache.size} 条思考缓存`);
+    }
+  } catch (error) {
+    console.error(`[proxy] 解析思考缓存失败（忽略）: ${error.message}`);
+  }
+}
+
+let cacheSaveTimer = null;
+
+function scheduleReasoningCacheSave() {
+  if (cacheSaveTimer) return;
+
+  // 防抖：一次对话会多次命中，等写入安静下来再落盘。
+  cacheSaveTimer = setTimeout(() => {
+    cacheSaveTimer = null;
+    try {
+      fs.writeFileSync(REASONING_CACHE_FILE, JSON.stringify([...reasoningCache]), 'utf8');
+    } catch (error) {
+      console.error(`[proxy] 保存思考缓存失败（忽略）: ${error.message}`);
+    }
+  }, 1000);
+  cacheSaveTimer.unref();
+}
+
+function rememberReasoning(toolCallIds, reasoningText) {
+  if (!toolCallIds.length || !reasoningText) return 0;
+  if (reasoningText.length > MAX_REASONING_ENTRY_CHARS) {
+    console.warn(`[proxy] 思考内容过长（${reasoningText.length} 字符），放弃缓存`);
+    return 0;
+  }
+
+  let stored = 0;
+  for (const id of toolCallIds) {
+    if (!id) continue;
+    // 重新插入以刷新 LRU 位置。
+    if (reasoningCache.has(id)) reasoningCache.delete(id);
+    reasoningCache.set(id, reasoningText);
+    stored++;
+  }
+
+  while (reasoningCache.size > REASONING_CACHE_LIMIT) {
+    reasoningCache.delete(reasoningCache.keys().next().value);
+  }
+
+  if (stored) scheduleReasoningCacheSave();
+  return stored;
+}
+
+// 兼容流式（SSE）与一次性 JSON 两种响应形状。
+function extractReasoningPayload(text) {
+  const reasoningParts = [];
+  const toolCallIds = [];
+
+  const collectChoice = (choice) => {
+    const delta = choice?.delta ?? choice?.message;
+    if (!delta) return;
+
+    const piece = delta.reasoning_content ?? delta.reasoning;
+    if (typeof piece === 'string' && piece.length > 0) {
+      reasoningParts.push(piece);
+    }
+
+    if (Array.isArray(delta.tool_calls)) {
+      for (const call of delta.tool_calls) {
+        if (call?.id) toolCallIds.push(call.id);
+      }
+    }
+  };
+
+  const collectJson = (payload) => {
+    let json;
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(json?.choices)) return;
+    for (const choice of json.choices) collectChoice(choice);
+  };
+
+  let sawSseFrame = false;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    sawSseFrame = true;
+    collectJson(payload);
+  }
+
+  if (!sawSseFrame) collectJson(text);
+
+  return { reasoning: reasoningParts.join(''), toolCallIds };
+}
+
+function injectMissingReasoning(body) {
+  const messages = body?.messages;
+  if (!Array.isArray(messages)) return { restored: 0, placeholder: 0 };
+
+  let restored = 0;
+  let placeholder = 0;
+
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) continue;
+
+    const existing = message.reasoning_content;
+    if (typeof existing === 'string' && existing.length > 0) continue;
+
+    let cached;
+    for (const call of message.tool_calls) {
+      const hit = call?.id ? reasoningCache.get(call.id) : undefined;
+      if (hit) {
+        cached = hit;
+        break;
+      }
+    }
+
+    if (cached) {
+      message.reasoning_content = cached;
+      restored++;
+    } else {
+      message.reasoning_content = REASONING_PLACEHOLDER;
+      placeholder++;
+    }
+  }
+
+  return { restored, placeholder };
+}
+
 function applyThinkEffort(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return body;
@@ -160,8 +331,17 @@ function injectThinkEffort(rawBody, pathname) {
 
   applyThinkEffort(parsed);
 
+  // 仅思考模式需要回填：none 模式下上游不做该校验。
+  const fixed = thinkEffort === 'none'
+    ? { restored: 0, placeholder: 0 }
+    : injectMissingReasoning(parsed);
+
+  const notes = [`reasoning_effort=${thinkEffort}`];
+  if (fixed.restored) notes.push(`回填思考 ${fixed.restored} 条`);
+  if (fixed.placeholder) notes.push(`占位思考 ${fixed.placeholder} 条`);
+  console.log(`[proxy] 注入 ${notes.join('，')}`);
+
   const serialized = Buffer.from(JSON.stringify(parsed), 'utf8');
-  console.log(`[proxy] 注入 reasoning_effort=${thinkEffort}`);
   return serialized;
 }
 
@@ -248,6 +428,41 @@ function logRequest(method, path, statusCode) {
   console.log(`[proxy] ${method} ${path} -> ${statusCode} (session ${SESSION_ID})`);
 }
 
+// 旁路监听响应数据流：不影响原有转发，只在流结束后分析出思考内容与 tool_call id。
+function sniffReasoningFromUpstream(upstreamResponse) {
+  const chunks = [];
+  let total = 0;
+
+  upstreamResponse.on('data', (chunk) => {
+    if (total > MAX_RESPONSE_SNIFF_BYTES) return;
+    total += chunk.length;
+    if (total > MAX_RESPONSE_SNIFF_BYTES) {
+      chunks.length = 0;
+      return;
+    }
+    chunks.push(chunk);
+  });
+
+  upstreamResponse.on('end', () => {
+    if (!chunks.length) return;
+    try {
+      const { reasoning, toolCallIds } = extractReasoningPayload(Buffer.concat(chunks).toString('utf8'));
+      const stored = rememberReasoning(toolCallIds, reasoning);
+      if (stored) {
+        console.log(`[proxy] 缓存思考内容 ${reasoning.length} 字符 → ${stored} 个 tool_call`);
+      }
+    } catch (error) {
+      console.error(`[proxy] 解析响应思考内容失败: ${error.message}`);
+    } finally {
+      chunks.length = 0;
+    }
+  });
+
+  upstreamResponse.on('error', () => {
+    chunks.length = 0;
+  });
+}
+
 function handleRequest(request, response) {
   const targetPath = getUpstreamPath(request.url);
   const target = new URL(targetPath, UPSTREAM_ORIGIN);
@@ -269,6 +484,11 @@ function handleRequest(request, response) {
     (upstreamResponse) => {
       const responseHeaders = copyEndToEndHeaders(upstreamResponse.headers);
       const statusCode = upstreamResponse.statusCode ?? 502;
+
+      // 只嗅探成功的 chat/completions 响应，其余原样透传。
+      if (statusCode === 200 && isChatCompletionsPath(target.pathname)) {
+        sniffReasoningFromUpstream(upstreamResponse);
+      }
 
       if (!response.destroyed) {
         response.writeHead(statusCode, responseHeaders);
@@ -357,6 +577,8 @@ process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 async function main() {
+  loadReasoningCache();
+
   const cliValue = parseThinkEffortArg(process.argv[2]);
 
   if (process.argv[2] !== undefined && cliValue === undefined) {
