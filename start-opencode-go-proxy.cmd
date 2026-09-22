@@ -3,7 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 
-where node >nul 2>&1
+node --version >nul 2>&1
 if errorlevel 1 (
   echo [proxy] Node.js was not found in PATH.
   echo [proxy] Install Node.js 18 or newer, then run this file again.
